@@ -1,140 +1,215 @@
+extern crate winapi;
+
+use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Error, Read};
+use std::ptr::null_mut;
 use std::time::Instant;
 use indicatif::{ProgressBar, ProgressStyle};
+use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::memoryapi::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ};
+use winapi::um::winnt::{GENERIC_READ, HANDLE, IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE, PAGE_READONLY, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64};
 
-// Dosya boyutunu bulma fonksiyonu
-fn get_file_size<P: AsRef<Path>>(path: P) -> io::Result<u64> {
-    let mut file = File::open(path)?;
-    let file_size = file.seek(SeekFrom::End(0))?;
-    Ok(file_size)
+const D: u64 = 256;
+
+fn rk_search(pat: &str, txt: &[u8], q: u64) {
+    let m = pat.len();
+    let n = txt.len();
+    let mut p = 0; // hash value for pattern
+    let mut t = 0; // hash value for text
+    let mut h = 1;
+
+    // The value of h would be "pow(d, M-1)%q"
+    for _ in 0..m-1 {
+        h = (h * D) % q;
+    }
+
+    // Calculate the hash value of pattern and first window of text
+    for i in 0..m {
+        p = (D * p + pat.as_bytes()[i] as u64) % q;
+        t = (D * t + txt[i] as u64) % q;
+    }
+
+    // Slide the pattern over text one by one
+    for i in 0..=(n - m) {
+        if p == t {
+            // Check for characters one by one
+            let mut j = 0;
+            while j < m && txt[(i + j) as usize] == pat.as_bytes()[j] {
+                j += 1;
+            }
+
+            // if p == t and pat[0...M-1] = txt[i, i+1, ... i+M-1]
+            if j == m {
+                println!("Pattern found at index {}", i);
+            }
+        }
+
+        // Calculate hash value for next window of text:
+        // Remove leading digit, add trailing digit
+        if i < n - m {
+            let txt_i = txt[i as usize] as u64;
+            let txt_i_m = txt[(i + m) as usize] as u64;
+            
+            // Ensure that t - txt_i * h does not overflow
+            let new_t = (D * (t + q - (txt_i * h) % q) + txt_i_m) % q;
+
+            // Update t
+            t = new_t;
+        }
+    }
 }
 
-// Dosyayı okuyup bir diziye atma fonksiyonu
-fn read_all_bytes<P: AsRef<Path> + Clone>(path: P) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path.clone())?;
-    let file_size = get_file_size(path)?;
-    let mut buffer = vec![0; file_size as usize];
-    file.read_exact(&mut buffer)?;
+fn read_all_bytes(path: &str) -> Result<Vec<u8>, Error> {
+    let mut file = File::open(path)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
     Ok(buffer)
 }
 
-// Dizin içerisindeki dosyaları listeleme fonksiyonu
-fn sub_dir_list_files<P: AsRef<Path>>(dir_path: P) -> io::Result<Vec<String>> {
+fn list_files(path: &str) -> Result<Vec<String>, Error> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(dir_path)? {
+    for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            files.push(path.to_string_lossy().into_owned());
+        if entry.file_type()?.is_file() {
+            files.push(entry.path().display().to_string());
         }
     }
     Ok(files)
 }
 
-// Arama fonksiyonu
-fn search(keywords: &str, file_path: &str, q: i32, progress_bar: &ProgressBar) -> io::Result<()> {
-    let pat = keywords.as_bytes();
-    let m = pat.len();
-    let n = get_file_size(file_path)? as usize;
-    let txt = read_all_bytes(file_path)?;
-    
-    let mut p = 0; // Pattern hash değeri
-    let mut t = 0; // Text hash değeri
-    let mut h = 1;
+fn get_nt_header_signature(file_path: &str) -> Result<String, Error> {
+    unsafe {
+        let file_name = CString::new(file_path).unwrap();
+        let file_handle = CreateFileA(
+            file_name.as_ptr(),
+            GENERIC_READ,
+            0,
+            null_mut(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        );
 
-    // h'nin değerini hesapla
-    for _ in 0..m-1 {
-        h = (h * 256) % q;
-    }
-
-    // Pattern ve text'in ilk penceresinin hash değerlerini hesapla
-    for i in 0..m {
-        p = (256 * p + pat[i] as i32) % q;
-        t = (256 * t + txt[i] as i32) % q;
-    }
-
-    // Pattern'i text üzerinde kaydırarak ara
-    for i in 0..=n - m {
-        // Mevcut pencerenin hash değerlerini kontrol et
-        if p == t {
-            // Karakterleri tek tek kontrol et
-            if &txt[i..i + m] == pat {
-                println!("Pattern found at index {}", i);
-            }
+        if file_handle == INVALID_HANDLE_VALUE {
+            return Err(Error::last_os_error());
         }
 
-        // Sonraki pencere için hash değerini hesapla
-        if i < n - m {
-            t = (256 * (t - (txt[i] as i32 * h)) + txt[i + m] as i32) % q;
-            if t < 0 {
-                t += q;
-            }
+        let mapping_handle = CreateFileMappingW(
+            file_handle,
+            null_mut(),
+            PAGE_READONLY,
+            0,
+            0,
+            null_mut(),
+        );
+
+        if mapping_handle == null_mut() {
+            CloseHandle(file_handle);
+            return Err(Error::last_os_error());
         }
 
-        // İlerleme çubuğunu güncelle
-        progress_bar.inc(1);
-    }
+        let base_address = MapViewOfFile(
+            mapping_handle,
+            FILE_MAP_READ,
+            0,
+            0,
+            0,
+        );
 
-    progress_bar.finish();
-    Ok(())
+        if base_address == null_mut() {
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::last_os_error());
+        }
+
+        let dos_header = &*(base_address as *const IMAGE_DOS_HEADER);
+        if dos_header.e_magic != IMAGE_DOS_SIGNATURE {
+            UnmapViewOfFile(base_address);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
+        }
+
+        let nt_headers = &*((base_address as *const u8).offset(dos_header.e_lfanew as isize) as *const IMAGE_NT_HEADERS64);
+        if nt_headers.Signature != IMAGE_NT_SIGNATURE {
+            UnmapViewOfFile(base_address);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
+        }
+
+        let file_header = &nt_headers.FileHeader;
+        let machine = file_header.Machine;
+        if machine != IMAGE_FILE_MACHINE_I386 && machine != IMAGE_FILE_MACHINE_AMD64 {
+            UnmapViewOfFile(base_address);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
+        }
+
+        let signature = nt_headers.Signature.to_le_bytes();
+        let nt_signature_str = signature.iter().map(|b| *b as char).collect();
+
+        UnmapViewOfFile(base_address);
+        CloseHandle(mapping_handle);
+        CloseHandle(file_handle);
+
+        Ok(nt_signature_str)
+    }
 }
 
-fn main() -> io::Result<()> {
-    let q = 7; // Bir asal sayı
-
-    let mut dir_path = String::new();
-    println!("klasör dizinini giriniz(Enter the folder directory): ");
-    io::stdin().read_line(&mut dir_path)?;
-    let dir_path = dir_path.trim();
-
-    let mut csv_path = String::new();
-    println!("csv dosyasının yolunu giriniz(Enter the csv file path): ");
-    io::stdin().read_line(&mut csv_path)?;
-    let csv_path = csv_path.trim();
-
-    let dir_arr = sub_dir_list_files(dir_path)?;
-    let mut keywords = Vec::new();
-
-    let csv_file = File::open(csv_path)?;
-    let reader = io::BufReader::new(csv_file);
-
-    for line in reader.lines() {
-        let line = line?;
-        keywords.push(line);
-    }
-
-    let total_files = dir_arr.len() as u64;
-    let progress_bar = ProgressBar::new(total_files);
-    progress_bar.set_style(ProgressStyle::default_bar()
-        .template("{msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .progress_chars("#>-"));
-
+fn main() -> Result<(), Error> {
+    // Start the timer
     let start_time = Instant::now();
 
-    for entry in dir_arr {
-        for keyword in &keywords {
-            let file_size = get_file_size(&entry)? as usize;
-            let keyword_len = keyword.len();
-            let iterations = file_size.saturating_sub(keyword_len) as u64;
+    println!("Enter the folder directory:");
+    let mut dir_path = String::new();
+    std::io::stdin().read_line(&mut dir_path)?;
+    let dir_path = dir_path.trim();
 
-            let pb = ProgressBar::new(iterations);
-            pb.set_style(ProgressStyle::default_bar()
-                .template("{msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                .progress_chars("#>-"));
+    println!("Enter the directory of the CSV file:");
+    let mut csv_path = String::new();
+    std::io::stdin().read_line(&mut csv_path)?;
+    let csv_path = csv_path.trim();
 
-            pb.set_message(format!("Processing {}", entry));
+    let file_paths = list_files(dir_path)?;
+    let csv_data = read_all_bytes(csv_path)?;
 
-            search(keyword, &entry, q, &pb)?;
+    // Create a progress bar
+    let pb = ProgressBar::new(file_paths.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{msg} [{elapsed_precise}] [{bar:40}] {percent}%")
+        .progress_chars("#>-"));
+
+    for entry in file_paths {
+        let file_bytes = read_all_bytes(&entry)?;
+        if file_bytes.len() >= 2 && &file_bytes[0..2] == b"MZ" {
+            match get_nt_header_signature(&entry) {
+                Ok(nt_signature) => {
+                    println!();
+                    rk_search(&nt_signature, &csv_data, 7);
+                    println!("{} \nNT header signature found (ASCII): {}", entry, nt_signature);
+                    println!();
+                }
+                Err(_) => {
+                    println!("{} is not a valid PE file or has an unsupported architecture.", entry);
+                }
+            }
+        } else {
+            println!("{} is not a valid PE file.", entry);
         }
-        progress_bar.inc(1);
+
+        // Update the progress bar
+        pb.inc(1);
     }
 
-    progress_bar.finish_with_message("All files processed");
+    // Finish the progress bar
+    pb.finish_with_message("Done");
 
-    let duration = start_time.elapsed();
-    println!("Total duration: {:.2?} seconds", duration);
+    // Print elapsed time
+    println!("Elapsed time: {:?}", start_time.elapsed());
 
     Ok(())
 }
